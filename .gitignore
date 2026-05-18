@@ -5,3 +5,5 @@ target/
 pom.xml.versionsBackup
 dependency-reduced-pom.xml
 archives_config.json
+settings.json
+logs/app.log

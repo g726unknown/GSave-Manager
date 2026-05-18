@@ -3,11 +3,14 @@ package com.g726;
 import atlantafx.base.theme.PrimerLight;
 import javafx.application.Application;
 import javafx.application.Platform;
+import javafx.animation.FadeTransition;
+import javafx.animation.PauseTransition;
 import javafx.geometry.Bounds;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Scene;
 import javafx.scene.control.*;
+import javafx.scene.control.OverrunStyle;
 import javafx.scene.effect.DropShadow;
 import javafx.scene.input.MouseButton;
 import javafx.scene.input.ScrollEvent;
@@ -15,6 +18,7 @@ import javafx.scene.layout.*;
 import javafx.scene.paint.Color;
 import javafx.stage.DirectoryChooser;
 import javafx.stage.Stage;
+import javafx.util.Duration;
 
 import java.io.File;
 import java.nio.file.Paths;
@@ -24,11 +28,20 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.nio.file.Files;
 import java.nio.charset.StandardCharsets;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 public class MainApp extends Application {
 
     private ArchiveManager manager;
     private StackPane mainContentArea;
+    private StackPane rootStack;
+    private HBox toastBanner;
+    private FadeTransition toastFadeIn;
+    private FadeTransition toastFadeOut;
+    private PauseTransition toastDelay;
+    private final Logger logger = LoggingManager.getLogger();
+    private AppSettings settings;
 
     private StackPane gameListView; // 已升级为 StackPane 支持悬浮按钮
     private VBox settingsView;
@@ -47,6 +60,10 @@ public class MainApp extends Application {
 
     @Override
     public void init() throws Exception {
+        LoggingManager.init();
+        settings = SettingsManager.load();
+        branchLimitCache = new HashMap<>(settings.getBranchLimits());
+        saveToLatestBranch = settings.isSaveToLatestBranch();
         manager = new ArchiveManager();
     }
 
@@ -107,8 +124,16 @@ public class MainApp extends Application {
         root.setLeft(sideBar);
 
         Scene scene = new Scene(root, 1000, 650);
+        rootStack = new StackPane(root);
+        initToastBanner();
+        rootStack.getChildren().add(toastBanner);
+        StackPane.setAlignment(toastBanner, Pos.BOTTOM_LEFT);
+        StackPane.setMargin(toastBanner, new Insets(0, 0, 20, 20));
+
+        scene.setRoot(rootStack);
         primaryStage.setTitle("GSave Manager");
         primaryStage.setScene(scene);
+        primaryStage.setOnCloseRequest(e -> SettingsManager.save(settings));
         primaryStage.show();
     }
 
@@ -166,8 +191,10 @@ public class MainApp extends Application {
         btnRefresh.setStyle("-fx-background-color: " + ADD_GAME_BTN_COLOR
                 + "; -fx-text-fill: white; -fx-background-radius: 5px; -fx-cursor: hand;");
         btnRefresh.setOnAction(e -> {
-            manager.refreshArchives();
-            renderGameListView();
+            runWithErrorAlert("刷新失败", () -> {
+                manager.refreshArchives();
+                renderGameListView();
+            });
         });
         refreshRow.getChildren().addAll(refreshLabel, btnRefresh);
 
@@ -180,7 +207,7 @@ public class MainApp extends Application {
         Label infoIcon = new Label(" ⓘ ");
         infoIcon.setStyle("-fx-font-weight: bold; -fx-text-fill: #0366d6; -fx-cursor: hand;");
 
-        Tooltip infoTooltip = new Tooltip("关闭此项后，一键刷新功能就会保存到默认分支而非最新分支。");
+        Tooltip infoTooltip = new Tooltip("关闭此项后，一键刷新功能就会保存到默认分支而非最新分支");
         infoTooltip.setShowDelay(javafx.util.Duration.millis(0));
         infoTooltip.setStyle("-fx-font-size: 12px;");
 
@@ -197,7 +224,11 @@ public class MainApp extends Application {
         CheckBox toggleSwitch = new CheckBox();
         toggleSwitch.getStyleClass().add("blue-switch");
         toggleSwitch.setSelected(saveToLatestBranch);
-        toggleSwitch.setOnAction(e -> saveToLatestBranch = toggleSwitch.isSelected());
+        toggleSwitch.setOnAction(e -> {
+            saveToLatestBranch = toggleSwitch.isSelected();
+            settings.setSaveToLatestBranch(saveToLatestBranch);
+            SettingsManager.save(settings);
+        });
 
         oneKeyUpdateRow.getChildren().addAll(toggleLabel, infoIcon, toggleSwitch);
 
@@ -275,6 +306,8 @@ public class MainApp extends Application {
         globalFabBtn.setEffect(fabShadow);
 
         globalFabBtn.setOnAction(e -> {
+            int failedCount = 0;
+            String firstError = null;
             for (String gName : uniqueGames) {
                 String targetBranch = "默认分支";
                 if (saveToLatestBranch) {
@@ -290,9 +323,23 @@ public class MainApp extends Application {
                         targetBranch = latestA.getSaveName();
                     }
                 }
-                manager.updateArchive(gName, targetBranch);
+                try {
+                    manager.updateArchive(gName, targetBranch);
+                } catch (ArchiveOperationException ex) {
+                    failedCount++;
+                    if (firstError == null) {
+                        firstError = ex.getMessage();
+                    }
+                    logger.log(Level.WARNING, "一键更新失败: " + gName + " / " + targetBranch, ex);
+                }
             }
             renderGameListView();
+            if (failedCount > 0) {
+                String message = "共有 " + failedCount + " 个存档更新失败" +
+                        (firstError == null ? "" : "\n示例：" + firstError) +
+                        "\n详情请查看 logs/app.log";
+                showErrorAlert("一键更新失败", message);
+            }
         });
 
         StackPane.setAlignment(globalFabBtn, Pos.BOTTOM_RIGHT);
@@ -504,8 +551,10 @@ public class MainApp extends Application {
                 dialog.showAndWait().ifPresent(newName -> {
                     String trimmedName = newName.trim();
                     if (!trimmedName.isEmpty() && !branches.contains(trimmedName)) {
-                        manager.addArchive(gameName, trimmedName, finalSourcePath);
-                        openBranchDetailWithBranch(gameName, trimmedName);
+                        runWithErrorAlert("创建分支失败", () -> {
+                            manager.addArchive(gameName, trimmedName, finalSourcePath);
+                            openBranchDetailWithBranch(gameName, trimmedName);
+                        });
                     }
                 });
             } else if (selected != null && !selected.equals(currentBranch)) {
@@ -556,8 +605,12 @@ public class MainApp extends Application {
             try {
                 int limit = Integer.parseInt(historyInput.getText());
                 branchLimitCache.put(cacheKey, historyInput.getText());
-                manager.enforceHistoryLimit(gameName, currentBranch, limit);
-                openBranchDetailWithBranch(gameName, currentBranch);
+                settings.getBranchLimits().put(cacheKey, historyInput.getText());
+                SettingsManager.save(settings);
+                runWithErrorAlert("应用限制失败", () -> {
+                    manager.enforceHistoryLimit(gameName, currentBranch, limit);
+                    openBranchDetailWithBranch(gameName, currentBranch);
+                });
             } catch (NumberFormatException ex) {
             }
         });
@@ -592,8 +645,10 @@ public class MainApp extends Application {
             dialog.showAndWait().ifPresent(newName -> {
                 String trimmedName = newName.trim();
                 if (!trimmedName.isEmpty() && !branches.contains(trimmedName)) {
-                    manager.createBranchCopy(gameName, currentBranch, trimmedName);
-                    openBranchDetailWithBranch(gameName, trimmedName);
+                    runWithErrorAlert("复制分支失败", () -> {
+                        manager.createBranchCopy(gameName, currentBranch, trimmedName);
+                        openBranchDetailWithBranch(gameName, trimmedName);
+                    });
                 }
             });
         });
@@ -727,9 +782,11 @@ public class MainApp extends Application {
                 dialog.showAndWait().ifPresent(newName -> {
                     String trimmedName = newName.trim();
                     if (!trimmedName.isEmpty() && !branches.contains(trimmedName)) {
-                        manager.createBranchFromSnapshot(archive.getGameName(), archive.getSaveName(),
-                                archive.getTimeStamp(), trimmedName);
-                        openBranchDetailWithBranch(gameName, trimmedName);
+                        runWithErrorAlert("创建分叉失败", () -> {
+                            manager.createBranchFromSnapshot(archive.getGameName(), archive.getSaveName(),
+                                    archive.getTimeStamp(), trimmedName);
+                            openBranchDetailWithBranch(gameName, trimmedName);
+                        });
                     }
                 });
             });
@@ -768,13 +825,17 @@ public class MainApp extends Application {
         fabBtn.setEffect(fabShadow);
 
         fabBtn.setOnAction(e -> {
-            manager.updateArchive(gameName, currentBranch);
+            runWithErrorAlert("备份失败", () -> manager.updateArchive(gameName, currentBranch));
             try {
                 String limitText = historyInput.getText();
                 branchLimitCache.put(cacheKey, limitText);
+                settings.getBranchLimits().put(cacheKey, limitText);
+                SettingsManager.save(settings);
                 int limit = Integer.parseInt(limitText);
-                if (limit > 0)
-                    manager.enforceHistoryLimit(gameName, currentBranch, limit);
+                if (limit > 0) {
+                    runWithErrorAlert("历史限制处理失败",
+                            () -> manager.enforceHistoryLimit(gameName, currentBranch, limit));
+                }
             } catch (NumberFormatException ex) {
             }
             openBranchDetailWithBranch(gameName, currentBranch);
@@ -816,9 +877,93 @@ public class MainApp extends Application {
 
         alert.showAndWait().ifPresent(response -> {
             if (response == ButtonType.OK) {
-                action.run();
+                runWithErrorAlert(header + "失败", action);
             }
         });
+    }
+
+    private void runWithErrorAlert(String title, Runnable action) {
+        try {
+            action.run();
+        } catch (ArchiveOperationException ex) {
+            logger.log(Level.WARNING, title, ex);
+            showErrorAlert(title, ex.getMessage() + "\n详情请查看 logs/app.log");
+        } catch (Exception ex) {
+            logger.log(Level.SEVERE, title, ex);
+            showErrorAlert(title, "发生未知错误，请查看 logs/app.log");
+        }
+    }
+
+    private void showErrorAlert(String title, String message) {
+        String toastMessage = title + "：" + message;
+        showToast(toastMessage);
+    }
+
+    private void initToastBanner() {
+        toastBanner = new HBox(12);
+        toastBanner.setVisible(false);
+        toastBanner.setOpacity(0);
+        toastBanner.setAlignment(Pos.CENTER_LEFT);
+        toastBanner.setMaxWidth(Region.USE_PREF_SIZE);
+        toastBanner.setPrefWidth(Region.USE_COMPUTED_SIZE);
+        toastBanner.setMinWidth(Region.USE_PREF_SIZE);
+        toastBanner.setMaxHeight(Region.USE_PREF_SIZE);
+        toastBanner.setPrefHeight(Region.USE_COMPUTED_SIZE);
+        toastBanner.setMinHeight(Region.USE_PREF_SIZE);
+        toastBanner.setPadding(new Insets(10, 14, 10, 14));
+        toastBanner.setStyle(
+                "-fx-background-color: rgba(0, 0, 0, 0.65);" +
+                "-fx-background-radius: 8px;" +
+                "-fx-border-radius: 8px;" +
+                "-fx-border-color: rgba(255, 255, 255, 0.15);");
+
+        Label messageLabel = new Label();
+        messageLabel.setStyle("-fx-text-fill: white; -fx-font-size: 13px;");
+        messageLabel.setWrapText(false);
+        messageLabel.setTextOverrun(OverrunStyle.ELLIPSIS);
+        messageLabel.setMaxWidth(Region.USE_PREF_SIZE);
+        messageLabel.setMaxHeight(Region.USE_PREF_SIZE);
+
+        Button closeBtn = new Button("✕");
+        closeBtn.setStyle(
+                "-fx-background-color: transparent;" +
+                "-fx-text-fill: white;" +
+                "-fx-font-size: 12px;" +
+                "-fx-cursor: hand;");
+        closeBtn.setOnAction(e -> hideToast());
+
+        toastBanner.getChildren().addAll(messageLabel, closeBtn);
+        toastBanner.setUserData(messageLabel);
+
+        toastFadeIn = new FadeTransition(Duration.millis(180), toastBanner);
+        toastFadeIn.setFromValue(0);
+        toastFadeIn.setToValue(1);
+
+        toastFadeOut = new FadeTransition(Duration.millis(260), toastBanner);
+        toastFadeOut.setFromValue(1);
+        toastFadeOut.setToValue(0);
+        toastFadeOut.setOnFinished(e -> toastBanner.setVisible(false));
+
+        toastDelay = new PauseTransition(Duration.seconds(5));
+        toastDelay.setOnFinished(e -> hideToast());
+    }
+
+    private void showToast(String message) {
+        Label messageLabel = (Label) toastBanner.getUserData();
+        messageLabel.setText(message);
+        toastDelay.stop();
+        toastFadeOut.stop();
+        toastFadeIn.stop();
+
+        toastBanner.setVisible(true);
+        toastFadeIn.playFromStart();
+        toastDelay.playFromStart();
+    }
+
+    private void hideToast() {
+        toastDelay.stop();
+        toastFadeIn.stop();
+        toastFadeOut.playFromStart();
     }
 
     private void handleAddNewGame() {
@@ -830,7 +975,7 @@ public class MainApp extends Application {
 
             Path selectedPath = selectedDir.toPath();
             if (selectedPath.getParent() == null || selectedPath.getNameCount() <= 1) {
-                Alert alert = new Alert(Alert.AlertType.ERROR, "为了您的数据安全，禁止直接选择磁盘根目录或一级目录作为存档源！\n请选择更深层级的具体游戏存档文件夹。");
+                Alert alert = new Alert(Alert.AlertType.ERROR, "为了您的数据安全，禁止直接选择磁盘根目录或一级目录作为存档源！\n请选择更深层级的具体游戏存档文件夹");
                 alert.showAndWait();
                 return;
             }
@@ -844,8 +989,10 @@ public class MainApp extends Application {
             result.ifPresent(gameName -> {
                 String trimmedName = gameName.trim();
                 if (!trimmedName.isEmpty()) {
-                    manager.addArchive(trimmedName, "默认分支", selectedDir.getAbsolutePath());
-                    renderGameListView();
+                    runWithErrorAlert("添加存档失败", () -> {
+                        manager.addArchive(trimmedName, "默认分支", selectedDir.getAbsolutePath());
+                        renderGameListView();
+                    });
                 }
             });
         }
@@ -891,7 +1038,7 @@ public class MainApp extends Application {
 
         File readmeFile = new File("README.md");
         if (!readmeFile.exists()) {
-            container.getChildren().add(createWrapLabel("未找到 README.md 文件。\n请确保将 README.md 放在软件运行的同级目录下。"));
+            container.getChildren().add(createWrapLabel("未找到 README.md 文件\n请确保将 README.md 放在软件运行的同级目录下"));
             return container;
         }
 

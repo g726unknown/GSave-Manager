@@ -5,6 +5,8 @@ import com.google.gson.reflect.TypeToken;
 
 import java.io.*;
 import java.lang.reflect.Type;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.LocalDateTime;
@@ -14,6 +16,7 @@ import java.util.List;
 public class JsonManager {
 
     private static final String CONFIG_FILE = "archives_config.json";
+    private static final Logger LOGGER = LoggingManager.getLogger();
 
     private static final Gson gson = new GsonBuilder()
             .registerTypeHierarchyAdapter(Path.class, new PathAdapter())
@@ -24,9 +27,9 @@ public class JsonManager {
     public static void saveToJson(List<GameArchive> archives) {
         try (Writer writer = new FileWriter(CONFIG_FILE)) {
             gson.toJson(archives, writer);
-            System.out.println("存档配置已成功保存到: " + CONFIG_FILE);
+            LOGGER.info("存档配置已成功保存到: " + CONFIG_FILE);
         } catch (IOException e) {
-            System.err.println("保存 JSON 失败: " + e.getMessage());
+            LOGGER.log(Level.SEVERE, "保存 JSON 失败", e);
         }
     }
 
@@ -40,7 +43,7 @@ public class JsonManager {
             }.getType();
             return gson.fromJson(reader, listType);
         } catch (IOException e) {
-            System.err.println("读取 JSON 失败: " + e.getMessage());
+            LOGGER.log(Level.SEVERE, "读取 JSON 失败", e);
             return new ArrayList<>();
         }
     }

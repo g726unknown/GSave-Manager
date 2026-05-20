@@ -4,13 +4,16 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 public class ArchiveManager {
     private List<GameArchive> archives;
-    private final Logger logger = LoggingManager.getLogger();
+    private final Logger logger = SomeUtils.getLogger();
 
     public ArchiveManager() {
         this.archives = JsonManager.loadFromJson();
@@ -18,6 +21,70 @@ public class ArchiveManager {
 
     public List<GameArchive> getAllArchives() {
         return archives;
+    }
+
+    public Set<String> getGameNames() {
+        Set<String> names = new HashSet<>();
+        for (GameArchive archive : archives) {
+            names.add(archive.getGameName());
+        }
+        return names;
+    }
+
+    public boolean hasGame(String gameName) {
+        for (GameArchive archive : archives) {
+            if (archive.getGameName().equals(gameName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public GameArchive getLatestArchiveForGame(String gameName) {
+        GameArchive latest = null;
+        for (GameArchive archive : archives) {
+            if (archive.getGameName().equals(gameName)) {
+                if (latest == null || archive.getTimeStamp().compareTo(latest.getTimeStamp()) > 0) {
+                    latest = archive;
+                }
+            }
+        }
+        return latest;
+    }
+
+    public String getLatestBranchNameForGame(String gameName) {
+        GameArchive latest = getLatestArchiveForGame(gameName);
+        return latest == null ? null : latest.getSaveName();
+    }
+
+    public String getSourcePathForGame(String gameName) {
+        for (GameArchive archive : archives) {
+            if (archive.getGameName().equals(gameName)) {
+                return archive.getAbsRawSavePathString();
+            }
+        }
+        return "";
+    }
+
+    public Set<String> getBranchesForGame(String gameName) {
+        Set<String> branches = new HashSet<>();
+        for (GameArchive archive : archives) {
+            if (archive.getGameName().equals(gameName)) {
+                branches.add(archive.getSaveName());
+            }
+        }
+        return branches;
+    }
+
+    public List<GameArchive> getArchivesForBranch(String gameName, String saveName) {
+        List<GameArchive> result = new ArrayList<>();
+        for (GameArchive archive : archives) {
+            if (archive.getGameName().equals(gameName) && archive.getSaveName().equals(saveName)) {
+                result.add(archive);
+            }
+        }
+        result.sort((a, b) -> b.getTimeStamp().compareTo(a.getTimeStamp()));
+        return result;
     }
 
     public void addArchive(String gameName, String saveName, String pathName) {
@@ -315,5 +382,15 @@ public class ArchiveManager {
                 return;
             }
         }
+    }
+}
+
+class ArchiveOperationException extends RuntimeException {
+    public ArchiveOperationException(String message) {
+        super(message);
+    }
+
+    public ArchiveOperationException(String message, Throwable cause) {
+        super(message, cause);
     }
 }

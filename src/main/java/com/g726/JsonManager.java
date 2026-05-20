@@ -16,7 +16,7 @@ import java.util.List;
 public class JsonManager {
 
     private static final String CONFIG_FILE = "archives_config.json";
-    private static final Logger LOGGER = LoggingManager.getLogger();
+    private static final Logger LOGGER = SomeUtils.getLogger();
 
     private static final Gson gson = new GsonBuilder()
             .registerTypeHierarchyAdapter(Path.class, new PathAdapter())
@@ -61,19 +61,16 @@ public class JsonManager {
     }
 
     private static class LocalDateTimeAdapter implements JsonSerializer<LocalDateTime>, JsonDeserializer<LocalDateTime> {
-        // 定义一个你喜欢的日期时间格式
         private static final java.time.format.DateTimeFormatter formatter = 
                 java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
         @Override
         public JsonElement serialize(LocalDateTime src, Type typeOfSrc, JsonSerializationContext context) {
-            // 保存到 JSON 时，格式化为字符串
             return new JsonPrimitive(src.format(formatter));
         }
 
         @Override
         public LocalDateTime deserialize(JsonElement json, Type typeOfT, JsonDeserializationContext context) {
-            // 从 JSON 读取时，解析回 LocalDateTime 对象
             return LocalDateTime.parse(json.getAsString(), formatter);
         }
     }

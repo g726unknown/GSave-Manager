@@ -17,7 +17,7 @@ import java.util.logging.Logger;
 public final class SettingsManager {
     private static final String SETTINGS_FILE = "settings.json";
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
-    private static final Logger LOGGER = LoggingManager.getLogger();
+    private static final Logger LOGGER = SomeUtils.getLogger();
 
     private SettingsManager() {
     }
@@ -47,5 +47,53 @@ public final class SettingsManager {
         } catch (IOException e) {
             LOGGER.log(Level.SEVERE, "保存 settings.json 失败。", e);
         }
+    }
+}
+
+class AppSettings {
+    private boolean saveToLatestBranch = true;
+    private java.util.Map<String, String> branchLimits = new java.util.HashMap<>();
+    private String autoSaveMode = "OFF";
+    private int autoSaveIntervalSeconds = 300;
+    private int autoSaveDebounceSeconds = 5;
+
+    public boolean isSaveToLatestBranch() {
+        return saveToLatestBranch;
+    }
+
+    public void setSaveToLatestBranch(boolean saveToLatestBranch) {
+        this.saveToLatestBranch = saveToLatestBranch;
+    }
+
+    public java.util.Map<String, String> getBranchLimits() {
+        return branchLimits;
+    }
+
+    public void setBranchLimits(java.util.Map<String, String> branchLimits) {
+        this.branchLimits = branchLimits == null ? new java.util.HashMap<>() : branchLimits;
+    }
+
+    public String getAutoSaveMode() {
+        return autoSaveMode;
+    }
+
+    public void setAutoSaveMode(String autoSaveMode) {
+        this.autoSaveMode = autoSaveMode == null ? "OFF" : autoSaveMode;
+    }
+
+    public int getAutoSaveIntervalSeconds() {
+        return autoSaveIntervalSeconds;
+    }
+
+    public void setAutoSaveIntervalSeconds(int autoSaveIntervalSeconds) {
+        this.autoSaveIntervalSeconds = autoSaveIntervalSeconds;
+    }
+
+    public int getAutoSaveDebounceSeconds() {
+        return autoSaveDebounceSeconds;
+    }
+
+    public void setAutoSaveDebounceSeconds(int autoSaveDebounceSeconds) {
+        this.autoSaveDebounceSeconds = autoSaveDebounceSeconds;
     }
 }

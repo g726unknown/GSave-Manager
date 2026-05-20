@@ -21,13 +21,22 @@ import javafx.stage.Stage;
 import javafx.util.Duration;
 
 import java.io.File;
+import java.io.IOException;
 import java.nio.file.Paths;
 import java.nio.file.Path;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
+import java.nio.file.ClosedWatchServiceException;
+import java.nio.file.StandardWatchEventKinds;
+import java.nio.file.WatchEvent;
+import java.nio.file.WatchKey;
+import java.nio.file.WatchService;
 import java.util.*;
 import java.nio.file.Files;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -40,8 +49,12 @@ public class MainApp extends Application {
     private FadeTransition toastFadeIn;
     private FadeTransition toastFadeOut;
     private PauseTransition toastDelay;
-    private final Logger logger = LoggingManager.getLogger();
+    private final Logger logger = SomeUtils.getLogger();
     private AppSettings settings;
+    private ScheduledExecutorService autoSaveScheduler;
+    private ExecutorService autoSaveWatchExecutor;
+    private WatchService autoSaveWatchService;
+    private final Map<String, Long> autoSaveDebounce = new ConcurrentHashMap<>();
 
     private StackPane gameListView; // 已升级为 StackPane 支持悬浮按钮
     private VBox settingsView;
@@ -60,11 +73,12 @@ public class MainApp extends Application {
 
     @Override
     public void init() throws Exception {
-        LoggingManager.init();
+        SomeUtils.initLogging();
         settings = SettingsManager.load();
         branchLimitCache = new HashMap<>(settings.getBranchLimits());
         saveToLatestBranch = settings.isSaveToLatestBranch();
         manager = new ArchiveManager();
+        startAutoSaveService();
     }
 
     @Override
@@ -133,7 +147,10 @@ public class MainApp extends Application {
         scene.setRoot(rootStack);
         primaryStage.setTitle("GSave Manager");
         primaryStage.setScene(scene);
-        primaryStage.setOnCloseRequest(e -> SettingsManager.save(settings));
+        primaryStage.setOnCloseRequest(e -> {
+            stopAutoSaveService();
+            SettingsManager.save(settings);
+        });
         primaryStage.show();
     }
 
@@ -232,7 +249,89 @@ public class MainApp extends Application {
 
         oneKeyUpdateRow.getChildren().addAll(toggleLabel, infoIcon, toggleSwitch);
 
-        settingsView.getChildren().addAll(settingsTitle, refreshRow, oneKeyUpdateRow);
+        HBox autoSaveModeRow = new HBox(12);
+        autoSaveModeRow.setAlignment(Pos.CENTER_LEFT);
+        Label autoSaveModeLabel = new Label("自动保存模式:");
+        autoSaveModeLabel.setStyle("-fx-font-size: 14px;");
+
+        ChoiceBox<String> autoSaveModeBox = new ChoiceBox<>();
+        autoSaveModeBox.getItems().addAll("关闭", "定时保存", "监听保存");
+        String currentMode = settings.getAutoSaveMode();
+        if ("INTERVAL".equals(currentMode)) {
+            autoSaveModeBox.setValue("定时保存");
+        } else if ("WATCH".equals(currentMode)) {
+            autoSaveModeBox.setValue("监听保存");
+        } else {
+            autoSaveModeBox.setValue("关闭");
+        }
+        autoSaveModeBox.setPrefHeight(32);
+
+        autoSaveModeRow.getChildren().addAll(autoSaveModeLabel, autoSaveModeBox);
+
+        HBox autoSaveIntervalRow = new HBox(12);
+        autoSaveIntervalRow.setAlignment(Pos.CENTER_LEFT);
+        Label autoSaveIntervalLabel = new Label("定时间隔(秒):");
+        autoSaveIntervalLabel.setStyle("-fx-font-size: 14px;");
+        TextField autoSaveIntervalInput = new TextField(String.valueOf(settings.getAutoSaveIntervalSeconds()));
+        autoSaveIntervalInput.setPrefWidth(100);
+        autoSaveIntervalInput.setPrefHeight(32);
+        autoSaveIntervalRow.getChildren().addAll(autoSaveIntervalLabel, autoSaveIntervalInput);
+
+        HBox autoSaveDebounceRow = new HBox(12);
+        autoSaveDebounceRow.setAlignment(Pos.CENTER_LEFT);
+        Label autoSaveDebounceLabel = new Label("抖动阈值(秒):");
+        autoSaveDebounceLabel.setStyle("-fx-font-size: 14px;");
+        TextField autoSaveDebounceInput = new TextField(String.valueOf(settings.getAutoSaveDebounceSeconds()));
+        autoSaveDebounceInput.setPrefWidth(100);
+        autoSaveDebounceInput.setPrefHeight(32);
+        autoSaveDebounceRow.getChildren().addAll(autoSaveDebounceLabel, autoSaveDebounceInput);
+
+        Button applyAutoSaveBtn = new Button("应用自动保存设置");
+        applyAutoSaveBtn.setPrefHeight(32);
+        applyAutoSaveBtn.getStyleClass().add("secondary-button");
+        applyAutoSaveBtn.setOnAction(e -> {
+            String modeText = autoSaveModeBox.getValue();
+            String mode = "OFF";
+            if ("定时保存".equals(modeText)) {
+                mode = "INTERVAL";
+            } else if ("监听保存".equals(modeText)) {
+                mode = "WATCH";
+            }
+
+            int intervalSeconds;
+            int debounceSeconds;
+            try {
+                intervalSeconds = Integer.parseInt(autoSaveIntervalInput.getText().trim());
+                debounceSeconds = Integer.parseInt(autoSaveDebounceInput.getText().trim());
+            } catch (NumberFormatException ex) {
+                showErrorAlert("自动保存设置错误", "请输入有效的数字");
+                return;
+            }
+
+            if ("INTERVAL".equals(mode) && intervalSeconds <= 0) {
+                showErrorAlert("自动保存设置错误", "定时间隔必须大于 0");
+                return;
+            }
+            if (debounceSeconds < 0) {
+                showErrorAlert("自动保存设置错误", "抖动阈值不能为负数");
+                return;
+            }
+
+            settings.setAutoSaveMode(mode);
+            settings.setAutoSaveIntervalSeconds(intervalSeconds);
+            settings.setAutoSaveDebounceSeconds(debounceSeconds);
+            SettingsManager.save(settings);
+            startAutoSaveService();
+        });
+
+        autoSaveModeBox.getSelectionModel().selectedItemProperty().addListener((obs, oldVal, newVal) -> {
+            boolean isInterval = "定时保存".equals(newVal);
+            autoSaveIntervalInput.setDisable(!isInterval);
+        });
+        autoSaveIntervalInput.setDisable(!"定时保存".equals(autoSaveModeBox.getValue()));
+
+        settingsView.getChildren().addAll(settingsTitle, refreshRow, oneKeyUpdateRow,
+            autoSaveModeRow, autoSaveIntervalRow, autoSaveDebounceRow, applyAutoSaveBtn);
         settingsView.setVisible(false);
 
         VBox aboutContent = parseReadmeToVBox();
@@ -257,23 +356,11 @@ public class MainApp extends Application {
         FlowPane cardsPane = new FlowPane(20, 20);
         cardsPane.setPadding(new Insets(20));
 
-        Set<String> uniqueGames = new HashSet<>();
-        for (GameArchive archive : manager.getAllArchives()) {
-            uniqueGames.add(archive.getGameName());
-        }
+        Set<String> uniqueGames = manager.getGameNames();
 
         for (String gameName : uniqueGames) {
-            GameArchive latestArchive = null;
-            String sourcePath = "";
-            for (GameArchive archive : manager.getAllArchives()) {
-                if (archive.getGameName().equals(gameName)) {
-                    if (sourcePath.isEmpty())
-                        sourcePath = archive.getAbsRawSavePathString();
-                    if (latestArchive == null || archive.getTimeStamp().compareTo(latestArchive.getTimeStamp()) > 0) {
-                        latestArchive = archive;
-                    }
-                }
-            }
+            GameArchive latestArchive = manager.getLatestArchiveForGame(gameName);
+            String sourcePath = manager.getSourcePathForGame(gameName);
 
             VBox gameCard = createGameCard(gameName, latestArchive, sourcePath);
             gameCard.setOnMouseClicked(e -> {
@@ -311,16 +398,9 @@ public class MainApp extends Application {
             for (String gName : uniqueGames) {
                 String targetBranch = "默认分支";
                 if (saveToLatestBranch) {
-                    GameArchive latestA = null;
-                    for (GameArchive a : manager.getAllArchives()) {
-                        if (a.getGameName().equals(gName)) {
-                            if (latestA == null || a.getTimeStamp().compareTo(latestA.getTimeStamp()) > 0) {
-                                latestA = a;
-                            }
-                        }
-                    }
-                    if (latestA != null) {
-                        targetBranch = latestA.getSaveName();
+                    String latestBranch = manager.getLatestBranchNameForGame(gName);
+                    if (latestBranch != null) {
+                        targetBranch = latestBranch;
                     }
                 }
                 try {
@@ -367,9 +447,8 @@ public class MainApp extends Application {
                 "-fx-font-size: 11px; -fx-text-fill: #6a737d; -fx-alignment: center; -fx-text-alignment: center;");
 
         if (latestArchive != null) {
-            DateTimeFormatter stampFormatter = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss");
-            LocalDateTime latestTime = LocalDateTime.parse(latestArchive.getTimeStamp(), stampFormatter);
-            timeLabel.setText("上次备份时间: \n" + latestTime.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")));
+            String displayTime = SomeUtils.formatTimestampForDisplay(latestArchive.getTimeStamp());
+            timeLabel.setText("上次备份时间: \n" + displayTime);
         }
 
         card.getChildren().addAll(nameLabel, statusLabel, timeLabel);
@@ -469,16 +548,7 @@ public class MainApp extends Application {
     }
 
     private void openBranchDetail(String gameName) {
-        String latestBranch = null;
-        GameArchive latestArchive = null;
-        for (GameArchive archive : manager.getAllArchives()) {
-            if (archive.getGameName().equals(gameName)) {
-                if (latestArchive == null || archive.getTimeStamp().compareTo(latestArchive.getTimeStamp()) > 0) {
-                    latestArchive = archive;
-                    latestBranch = archive.getSaveName();
-                }
-            }
-        }
+        String latestBranch = manager.getLatestBranchNameForGame(gameName);
         if (latestBranch != null) {
             openBranchDetailWithBranch(gameName, latestBranch);
         }
@@ -504,15 +574,8 @@ public class MainApp extends Application {
         Label titleLabel = new Label(gameName + " 详情管理");
         titleLabel.setStyle("-fx-font-size: 22px; -fx-font-weight: bold; -fx-text-fill: #24292f;");
 
-        Set<String> branches = new HashSet<>();
-        String sourceSavePath = "";
-        for (GameArchive a : manager.getAllArchives()) {
-            if (a.getGameName().equals(gameName)) {
-                branches.add(a.getSaveName());
-                if (sourceSavePath.isEmpty())
-                    sourceSavePath = a.getAbsRawSavePathString();
-            }
-        }
+        Set<String> branches = manager.getBranchesForGame(gameName);
+        String sourceSavePath = manager.getSourcePathForGame(gameName);
 
         ComboBox<String> branchSelector = new ComboBox<>();
         branchSelector.getItems().addAll(branches);
@@ -661,14 +724,7 @@ public class MainApp extends Application {
                 "确定要彻底删除【" + currentBranch + "】分支下的所有历史备份吗？\n此操作无法撤销！",
                 () -> {
                     manager.removeArchive(gameName, currentBranch);
-                    boolean gameStillExists = false;
-                    for (GameArchive a : manager.getAllArchives()) {
-                        if (a.getGameName().equals(gameName)) {
-                            gameStillExists = true;
-                            break;
-                        }
-                    }
-                    if (gameStillExists) {
+                    if (manager.hasGame(gameName)) {
                         openBranchDetail(gameName);
                     } else {
                         renderGameListView();
@@ -682,21 +738,14 @@ public class MainApp extends Application {
         VBox listContainer = new VBox(12);
         listContainer.setPadding(new Insets(20, 30, 100, 30));
 
-        List<GameArchive> archives = new ArrayList<>();
-        for (GameArchive a : manager.getAllArchives()) {
-            if (a.getGameName().equals(gameName) && a.getSaveName().equals(currentBranch))
-                archives.add(a);
-        }
-        archives.sort((a, b) -> b.getTimeStamp().compareTo(a.getTimeStamp()));
+        List<GameArchive> archives = manager.getArchivesForBranch(gameName, currentBranch);
 
         for (GameArchive archive : archives) {
             HBox row = new HBox(10);
             row.getStyleClass().add("timestamp-row");
             row.setAlignment(Pos.CENTER_LEFT);
 
-            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss");
-            LocalDateTime time = LocalDateTime.parse(archive.getTimeStamp(), formatter);
-            String baseTimeStr = time.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+            String baseTimeStr = SomeUtils.formatTimestampForDisplay(archive.getTimeStamp());
             String customName = archive.getCustomName();
 
             // 1. 组合容器
@@ -964,6 +1013,163 @@ public class MainApp extends Application {
         toastDelay.stop();
         toastFadeIn.stop();
         toastFadeOut.playFromStart();
+    }
+
+    private void startAutoSaveService() {
+        stopAutoSaveService();
+
+        String mode = settings.getAutoSaveMode();
+        if ("INTERVAL".equals(mode)) {
+            startIntervalAutoSave();
+        } else if ("WATCH".equals(mode)) {
+            startWatchAutoSave();
+        }
+    }
+
+    private void stopAutoSaveService() {
+        if (autoSaveScheduler != null) {
+            autoSaveScheduler.shutdownNow();
+            autoSaveScheduler = null;
+        }
+        if (autoSaveWatchService != null) {
+            try {
+                autoSaveWatchService.close();
+            } catch (Exception ex) {
+            }
+            autoSaveWatchService = null;
+        }
+        if (autoSaveWatchExecutor != null) {
+            autoSaveWatchExecutor.shutdownNow();
+            autoSaveWatchExecutor = null;
+        }
+        autoSaveDebounce.clear();
+    }
+
+    private void startIntervalAutoSave() {
+        int intervalSeconds = settings.getAutoSaveIntervalSeconds();
+        if (intervalSeconds <= 0) {
+            return;
+        }
+        autoSaveScheduler = Executors.newSingleThreadScheduledExecutor();
+        autoSaveScheduler.scheduleAtFixedRate(() -> {
+            for (String gameName : manager.getGameNames()) {
+                triggerAutoSaveForGame(gameName, "interval");
+            }
+        }, intervalSeconds, intervalSeconds, TimeUnit.SECONDS);
+    }
+
+    private void startWatchAutoSave() {
+        Map<Path, String> pathToGameName = new HashMap<>();
+        for (String gameName : manager.getGameNames()) {
+            String sourcePath = manager.getSourcePathForGame(gameName);
+            if (sourcePath == null || sourcePath.isEmpty()) {
+                continue;
+            }
+            Path path = Paths.get(sourcePath);
+            if (Files.isDirectory(path)) {
+                pathToGameName.put(path, gameName);
+            }
+        }
+
+        if (pathToGameName.isEmpty()) {
+            return;
+        }
+
+        try {
+            autoSaveWatchService = Paths.get(".").getFileSystem().newWatchService();
+            for (Path path : pathToGameName.keySet()) {
+                path.register(autoSaveWatchService,
+                        StandardWatchEventKinds.ENTRY_CREATE,
+                        StandardWatchEventKinds.ENTRY_DELETE,
+                        StandardWatchEventKinds.ENTRY_MODIFY);
+            }
+        } catch (IOException e) {
+            logger.log(Level.SEVERE, "自动监听初始化失败", e);
+            showAutoSaveError("自动监听失败", "无法初始化自动监听，请查看 logs/app.log");
+            return;
+        }
+
+        autoSaveWatchExecutor = Executors.newSingleThreadExecutor();
+        autoSaveWatchExecutor.execute(() -> {
+            while (true) {
+                WatchKey key;
+                try {
+                    key = autoSaveWatchService.take();
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (ClosedWatchServiceException ex) {
+                    break;
+                }
+
+                Path dir = (Path) key.watchable();
+                String gameName = pathToGameName.get(dir);
+                boolean hasChanges = false;
+
+                for (WatchEvent<?> event : key.pollEvents()) {
+                    if (event.kind() == StandardWatchEventKinds.OVERFLOW) {
+                        continue;
+                    }
+                    hasChanges = true;
+                }
+
+                if (hasChanges && gameName != null) {
+                    triggerAutoSaveForGame(gameName, "watch");
+                }
+
+                boolean valid = key.reset();
+                if (!valid) {
+                    pathToGameName.remove(dir);
+                    if (pathToGameName.isEmpty()) {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    private void triggerAutoSaveForGame(String gameName, String source) {
+        String targetBranch = "默认分支";
+        if (saveToLatestBranch) {
+            String latestBranch = manager.getLatestBranchNameForGame(gameName);
+            if (latestBranch != null) {
+                targetBranch = latestBranch;
+            }
+        }
+
+        if (!shouldAutoSave(gameName, targetBranch)) {
+            return;
+        }
+
+        try {
+            manager.updateArchive(gameName, targetBranch);
+        } catch (ArchiveOperationException ex) {
+            logger.log(Level.WARNING, "自动保存失败: " + gameName + " / " + source, ex);
+            showAutoSaveError("自动保存失败", ex.getMessage());
+        } catch (Exception ex) {
+            logger.log(Level.SEVERE, "自动保存异常: " + gameName + " / " + source, ex);
+            showAutoSaveError("自动保存异常", "发生未知错误，请查看 logs/app.log");
+        }
+    }
+
+    private void showAutoSaveError(String title, String message) {
+        Platform.runLater(() -> showErrorAlert(title, message));
+    }
+
+    private boolean shouldAutoSave(String gameName, String saveName) {
+        int debounceSeconds = settings.getAutoSaveDebounceSeconds();
+        if (debounceSeconds <= 0) {
+            return true;
+        }
+        long now = System.currentTimeMillis();
+        String key = gameName + "::" + saveName;
+        Long last = autoSaveDebounce.get(key);
+        long threshold = debounceSeconds * 1000L;
+        if (last != null && now - last < threshold) {
+            return false;
+        }
+        autoSaveDebounce.put(key, now);
+        return true;
     }
 
     private void handleAddNewGame() {

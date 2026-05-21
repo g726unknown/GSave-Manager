@@ -116,6 +116,7 @@ public class ArchiveManager {
             SomeUtils.copyDirectory(newArchive.getSavePath(), newArchive.getBackupPath());
             archives.add(newArchive);
             JsonManager.saveToJson(archives);
+            logger.info("已新增存档并完成首次备份: " + gameName + " / " + saveName);
 
         } catch (IOException e) {
             logger.log(Level.SEVERE, "备份失败", e);
@@ -154,6 +155,7 @@ public class ArchiveManager {
                 SomeUtils.copyDirectory(newSnapshot.getSavePath(), newSnapshot.getBackupPath());
                 archives.add(newSnapshot);
                 JsonManager.saveToJson(archives);
+                logger.info("已保存存档: " + gameName + " / " + saveName + " / " + newSnapshot.getTimeStamp());
 
             } catch (IOException e) {
                 logger.log(Level.SEVERE, "备份失败", e);

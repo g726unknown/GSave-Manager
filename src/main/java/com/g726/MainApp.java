@@ -255,12 +255,12 @@ public class MainApp extends Application {
         autoSaveModeLabel.setStyle("-fx-font-size: 14px;");
 
         ChoiceBox<String> autoSaveModeBox = new ChoiceBox<>();
-        autoSaveModeBox.getItems().addAll("关闭", "定时保存", "监听保存");
+        autoSaveModeBox.getItems().addAll("关闭", "定时保存", "自动保存");
         String currentMode = settings.getAutoSaveMode();
         if ("INTERVAL".equals(currentMode)) {
             autoSaveModeBox.setValue("定时保存");
         } else if ("WATCH".equals(currentMode)) {
-            autoSaveModeBox.setValue("监听保存");
+            autoSaveModeBox.setValue("自动保存");
         } else {
             autoSaveModeBox.setValue("关闭");
         }
@@ -270,7 +270,7 @@ public class MainApp extends Application {
 
         HBox autoSaveIntervalRow = new HBox(12);
         autoSaveIntervalRow.setAlignment(Pos.CENTER_LEFT);
-        Label autoSaveIntervalLabel = new Label("定时间隔(秒):");
+        Label autoSaveIntervalLabel = new Label("定时保存(秒):");
         autoSaveIntervalLabel.setStyle("-fx-font-size: 14px;");
         TextField autoSaveIntervalInput = new TextField(String.valueOf(settings.getAutoSaveIntervalSeconds()));
         autoSaveIntervalInput.setPrefWidth(100);
@@ -294,7 +294,7 @@ public class MainApp extends Application {
             String mode = "OFF";
             if ("定时保存".equals(modeText)) {
                 mode = "INTERVAL";
-            } else if ("监听保存".equals(modeText)) {
+            } else if ("自动保存".equals(modeText)) {
                 mode = "WATCH";
             }
 
@@ -1059,7 +1059,9 @@ public class MainApp extends Application {
     }
 
     private void startWatchAutoSave() {
-        Map<Path, String> pathToGameName = new HashMap<>();
+        Map<Path, Set<String>> pathToGameNames = new HashMap<>();
+        Map<WatchKey, Set<String>> keyToGameNames = new HashMap<>();
+        Map<WatchKey, Path> keyToDir = new HashMap<>();
         for (String gameName : manager.getGameNames()) {
             String sourcePath = manager.getSourcePathForGame(gameName);
             if (sourcePath == null || sourcePath.isEmpty()) {
@@ -1067,25 +1069,21 @@ public class MainApp extends Application {
             }
             Path path = Paths.get(sourcePath);
             if (Files.isDirectory(path)) {
-                pathToGameName.put(path, gameName);
+                pathToGameNames.computeIfAbsent(path, key -> new HashSet<>()).add(gameName);
             }
         }
 
-        if (pathToGameName.isEmpty()) {
+        if (pathToGameNames.isEmpty()) {
             return;
         }
 
         try {
             autoSaveWatchService = Paths.get(".").getFileSystem().newWatchService();
-            for (Path path : pathToGameName.keySet()) {
-                path.register(autoSaveWatchService,
-                        StandardWatchEventKinds.ENTRY_CREATE,
-                        StandardWatchEventKinds.ENTRY_DELETE,
-                        StandardWatchEventKinds.ENTRY_MODIFY);
+            for (Map.Entry<Path, Set<String>> entry : pathToGameNames.entrySet()) {
+                registerWatchTree(entry.getKey(), entry.getValue(), keyToGameNames, keyToDir);
             }
         } catch (IOException e) {
             logger.log(Level.SEVERE, "自动监听初始化失败", e);
-            showAutoSaveError("自动监听失败", "无法初始化自动监听，请查看 logs/app.log");
             return;
         }
 
@@ -1102,28 +1100,60 @@ public class MainApp extends Application {
                     break;
                 }
 
-                Path dir = (Path) key.watchable();
-                String gameName = pathToGameName.get(dir);
+                Path dir = keyToDir.get(key);
+                Set<String> gameNames = keyToGameNames.get(key);
                 boolean hasChanges = false;
 
                 for (WatchEvent<?> event : key.pollEvents()) {
                     if (event.kind() == StandardWatchEventKinds.OVERFLOW) {
                         continue;
                     }
+                    if (event.kind() == StandardWatchEventKinds.ENTRY_CREATE && dir != null) {
+                        Path child = dir.resolve((Path) event.context());
+                        if (Files.isDirectory(child)) {
+                            try {
+                                registerWatchTree(child, gameNames, keyToGameNames, keyToDir);
+                            } catch (IOException e) {
+                                logger.log(Level.WARNING, "自动监听注册目录失败: " + child, e);
+                            }
+                        }
+                    }
                     hasChanges = true;
                 }
 
-                if (hasChanges && gameName != null) {
-                    triggerAutoSaveForGame(gameName, "watch");
+                if (hasChanges && gameNames != null) {
+                    for (String gameName : gameNames) {
+                        triggerAutoSaveForGame(gameName, "watch");
+                    }
                 }
 
                 boolean valid = key.reset();
                 if (!valid) {
-                    pathToGameName.remove(dir);
-                    if (pathToGameName.isEmpty()) {
+                    keyToGameNames.remove(key);
+                    keyToDir.remove(key);
+                    if (keyToGameNames.isEmpty()) {
                         break;
                     }
                 }
+            }
+        });
+    }
+
+    private void registerWatchTree(Path root, Set<String> gameNames,
+                                   Map<WatchKey, Set<String>> keyToGameNames,
+                                   Map<WatchKey, Path> keyToDir) throws IOException {
+        Files.walkFileTree(root, new java.nio.file.SimpleFileVisitor<Path>() {
+            @Override
+            public java.nio.file.FileVisitResult preVisitDirectory(Path dir,
+                                                                   java.nio.file.attribute.BasicFileAttributes attrs)
+                    throws IOException {
+                WatchKey key = dir.register(autoSaveWatchService,
+                        StandardWatchEventKinds.ENTRY_CREATE,
+                        StandardWatchEventKinds.ENTRY_DELETE,
+                        StandardWatchEventKinds.ENTRY_MODIFY);
+                keyToGameNames.put(key, gameNames);
+                keyToDir.put(key, dir);
+                return java.nio.file.FileVisitResult.CONTINUE;
             }
         });
     }
@@ -1145,15 +1175,9 @@ public class MainApp extends Application {
             manager.updateArchive(gameName, targetBranch);
         } catch (ArchiveOperationException ex) {
             logger.log(Level.WARNING, "自动保存失败: " + gameName + " / " + source, ex);
-            showAutoSaveError("自动保存失败", ex.getMessage());
         } catch (Exception ex) {
             logger.log(Level.SEVERE, "自动保存异常: " + gameName + " / " + source, ex);
-            showAutoSaveError("自动保存异常", "发生未知错误，请查看 logs/app.log");
         }
-    }
-
-    private void showAutoSaveError(String title, String message) {
-        Platform.runLater(() -> showErrorAlert(title, message));
     }
 
     private boolean shouldAutoSave(String gameName, String saveName) {
